@@ -1,0 +1,6 @@
+keys.json
+AutoArtPoster/*.txt
+AutoArtPoster/*/
+AutoArtPoster/*.user
+AutoArtPoster/*.md
+.vs
