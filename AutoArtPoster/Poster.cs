@@ -1,78 +1,107 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Diagnostics;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
+﻿using System.Diagnostics;
 using System.Text.Json;
-using System.Net.Http.Headers;
-using System.Net;
 
 namespace AutoArtPoster
 {
     internal class Poster
     {
-        private HttpClient http;
-        private string token;
-        private string v;
-        public string groupId;
+        private HttpClient _http;
+        private Config _config;
+        private string _currentDirectory;
+        private List<string> _savedPhotos;
 
-        // MSK-3 для конверта в UTC
-        private readonly HashSet<int> postingHours = new HashSet<int>() { 9, 13, 17 };
-
-        private string currentDirectory;
-        private string uploadFileName = "upload.txt";
-        private List<string> savedPhotos;
+        // Часы, на которые откладывать посты по UTC (MSK-3)
+        private readonly HashSet<int> _postingHours = new HashSet<int>() { 9, 13, 17 };
+        private readonly string _configFileName = "config.json";
+        private readonly string _uploadFileName = "upload.txt";
 
         public Poster(HttpClient client)
         {
-            http = client;
-            currentDirectory = Directory.GetCurrentDirectory();
+            _http = client;
+            _currentDirectory = Directory.GetCurrentDirectory();
+            _savedPhotos = new List<string>();
 
-            LoadKeys();
+            CreateConfigIfNotExist();
+            _config = LoadKeysFromConfig();
 
-            savedPhotos = new List<string>();
         }
 
         async public Task StartExecution()
         {
+            await ValidateAccessToken();
             string[] urls = GetUrlsFromUploadFile();
 
             await ExecuteAsync(urls);
 
-            await DeleteTempFiles();
-
+            DeleteTempFiles();
             Console.WriteLine("Работа скрипта завершена");
-            Console.ReadKey(true);
         }
 
-        async public Task ExecuteAsync(string[] imageUrls)
+        async private Task ExecuteAsync(string[] imageUrls)
         {
             string uploadUrl = await GetUploadUrl();
-            Console.WriteLine("Получен upload_url");
-
             await UploadImages(uploadUrl, imageUrls);
-
             await PostSavedImages();
         }
 
-        public async Task DeleteTempFiles()
+        async private Task UploadImages(string uploadUrl, string[] imageUrls)
         {
-            File.Delete($"{currentDirectory}/{uploadFileName}");
+            var values = new Dictionary<string, string>
+            {
+                { "group_id", _config.groupId },
+                { "photo", "" },
+                { "hash", "" },
+                { "server", "" }
+            };
+
+            Console.WriteLine("Начало загрузки " + imageUrls.Length + " изображений");
+            Console.Write("Изображений загружено: ");
+            var cursorPos = Console.GetCursorPosition();
+            int imageCount = 0;
+            foreach (var imageUrl in imageUrls)
+            {
+                UploadedPhoto photoData;
+
+                using (var multipartFormContent = new MultipartFormDataContent())
+                {
+                    var image = await _http.GetAsync(imageUrl);
+                    multipartFormContent.Add(image.Content, name: "file", fileName: "image.jpg");
+
+                    var response = await _http.PostAsync(uploadUrl, multipartFormContent);
+                    photoData = GetUploadedPhoto(await response.Content.ReadAsStringAsync());
+                }
+
+                // Сохраняем информацию о загруженном изображении
+                values["photo"] = photoData.photo;
+                values["hash"] = photoData.hash;
+                values["server"] = $"{photoData.server}";
+
+                var saveResponse = await CallVkMethod("photos.saveWallPhoto", values);
+                var savedPhotoUrl = GetSavedPhotoUrl(await saveResponse.Content.ReadAsStringAsync());
+                _savedPhotos.Add(savedPhotoUrl);
+
+                imageCount++;
+                Console.SetCursorPosition(cursorPos.Left, cursorPos.Top);
+                Console.Write(imageCount);
+            }
+            Console.WriteLine();
+            Console.WriteLine("Изображения загружены на сервер");
         }
 
-        async public Task PostSavedImages()
+        async private Task PostSavedImages()
         {
-            var values = new Dictionary<string, string>();
-            values.Add("owner_id", $"-{groupId}");
-            values.Add("from_group", "1");
-            values.Add("attachments", "");
-            values.Add("publish_date", "");
+            var values = new Dictionary<string, string>
+            {
+                { "owner_id", $"-{_config.groupId}" },
+                { "from_group", "1" },
+                { "attachments", "" },
+                { "publish_date", "" }
+            };
 
             var latestPostponedPostInTicks = await GetLatestPostTime();
 
             var nextPublishDate = GetAppropriatePostTime(latestPostponedPostInTicks);
-            foreach (var photoUrl in savedPhotos)
+            foreach (var photoUrl in _savedPhotos)
             {
                 values["attachments"] = photoUrl;
                 values["publish_date"] = nextPublishDate;
@@ -82,6 +111,7 @@ namespace AutoArtPoster
                 Console.WriteLine($"Успешно создана отложенная запись на дату {postTime.Day}.{postTime.Month}.{postTime.Year} {postTime.Hour}:{postTime.Minute}");
 
                 nextPublishDate = GetAppropriatePostTime(nextPublishDate);
+                // Небольшая задержка, чтобы API не послал меня куда подальше из-за спама
                 Thread.Sleep(500);
             }
         }
@@ -90,11 +120,10 @@ namespace AutoArtPoster
         {
             DateTime prevPost = DateTime.UnixEpoch.AddSeconds(Int32.Parse(previousPost));
 
-            if (!postingHours.Contains(prevPost.Hour))
+            if (!_postingHours.Contains(prevPost.Hour))
             {
                 Console.WriteLine($"Последний пост в паблике отложен на {prevPost.Hour}:{prevPost.Minute} по UTC (MSK-3)");
                 Console.WriteLine("Невозможно подобрать время для нового поста с таким временем последнего поста");
-                Console.ReadKey(true);
                 throw new Exception();
             }
 
@@ -112,10 +141,12 @@ namespace AutoArtPoster
         async private Task<string> GetLatestPostTime()
         {
             // Определяем последний отложенный пост
-            var values = new Dictionary<string, string>();
-            values.Add("owner_id", $"-{groupId}");
-            values.Add("filter", "postponed");
-            values.Add("count", "1");
+            var values = new Dictionary<string, string>
+            {
+                { "owner_id", $"-{_config.groupId}" },
+                { "filter", "postponed" },
+                { "count", "1" }
+            };
             var response = await CallVkMethod("wall.get", values);
 
             // Сначала делаем запрос ради получения количества постов в отложке
@@ -124,6 +155,11 @@ namespace AutoArtPoster
                 .GetProperty("response")
                 .GetProperty("count")
                 .ToString());
+
+            if (postponedPostsCount < 1)
+            {
+                return GetLatestAppropriateTimeToday();
+            }
 
             // Затем добавляем оффсет, чтобы получить последний пост в отложке
             values.Add("offset", $"{postponedPostsCount - 1}");
@@ -138,68 +174,46 @@ namespace AutoArtPoster
             return latestDate;
         }
 
-        async public Task UploadImages(string uploadUrl, string[] imageUrls)
+        // Возвращаем сегодняшнюю дату в 17:00
+        private string GetLatestAppropriateTimeToday()
         {
-            // до 6 изображений за раз (ограничение вк апи)
-            var values = new Dictionary<string, string>();
-            values.Add("group_id", groupId);
-            values.Add("photo", "");
-            values.Add("hash", "");
-            values.Add("server", "");
-
-            Console.WriteLine("Начало загрузки " + imageUrls.Length + " изображений");
-            Console.Write("Изображений загружено: ");
-            var cursorPos = Console.GetCursorPosition();
-            int imageCount = 0;
-            foreach (var imageUrl in imageUrls)
-            {
-                UploadedPhoto photoData;
-
-                using (var multipartFormContent = new MultipartFormDataContent())
-                {
-                    var image = await http.GetAsync(imageUrl);
-                    multipartFormContent.Add(image.Content, name: "file", fileName: "image.jpg");
-
-                    var response = await http.PostAsync(uploadUrl, multipartFormContent);
-                    photoData = GetUploadedPhoto(await response.Content.ReadAsStringAsync());
-                }
-
-                // Сохраняем загруженное изображение
-                values["photo"] = photoData.photo;
-                values["hash"] = photoData.hash;
-                values["server"] = $"{photoData.server}";
-
-                var saveResponse = await CallVkMethod("photos.saveWallPhoto", values);
-                var savedPhotoUrl = GetSavedPhotoUrl(await saveResponse.Content.ReadAsStringAsync());
-                savedPhotos.Add(savedPhotoUrl);
-
-                imageCount++;
-                Console.SetCursorPosition(cursorPos.Left, cursorPos.Top);
-                Console.Write(imageCount);
-            }
-            Console.WriteLine();
-            Console.WriteLine("Изображения загружены на сервер");
+            // доходим до ровных чисел
+            var now = DateTimeOffset.UtcNow;
+            now = now.AddSeconds(60 - now.Second);
+            now = now.AddMinutes(60 - now.Minute);
+            long nowAsUnix = now.ToUnixTimeSeconds();
+            if (now.Hour == 17) return nowAsUnix.ToString();
+            var diff = 0;
+            if (now.Hour > 17)
+                diff = now.Hour - 17;
+            else
+                diff = 17 - now.Hour;
+            return (nowAsUnix + (3600 * diff)).ToString();
         }
 
-        async public Task<string> GetUploadUrl()
+        async private Task<string> GetUploadUrl()
         {
-            var values = new Dictionary<string, string>();
-            values.Add("group_id", groupId);
+            var values = new Dictionary<string, string>
+            {
+                { "group_id", _config.groupId }
+            };
             var response = await CallVkMethod("photos.getWallUploadServer", values);
 
             var upload_url = JsonSerializer.Deserialize<JsonElement>(await response.Content.ReadAsStringAsync())
                 .GetProperty("response")
                 .GetProperty("upload_url")
                 .ToString();
+
+            Console.WriteLine("Получен upload_url");
             return upload_url;
         }
 
-        public string[] GetUrlsFromUploadFile()
+        private string[] GetUrlsFromUploadFile()
         {
             Console.WriteLine("Загрузка файла с ссылками на арты");
-            if (!File.Exists(uploadFileName))
+            if (!File.Exists(_uploadFileName))
             {
-                var file = File.Create(uploadFileName);
+                var file = File.Create(_uploadFileName);
                 file.Close();
                 Console.WriteLine("Файл с ссылками не был обнаружен. Создан новый файл. Нажмите любую кнопку после заполнения файла");
                 Console.ReadKey(true);
@@ -207,35 +221,15 @@ namespace AutoArtPoster
 
             try
             {
-                string[] urls = File.ReadAllLines(uploadFileName);
+                string[] urls = File.ReadAllLines(_uploadFileName);
                 if (urls.Length == 0) throw new Exception();
                 return urls;
             }
             catch (Exception)
             {
                 Console.WriteLine("Файла не существует, либо он пуст");
-                Console.ReadKey(true);
                 throw;
             }
-        }
-
-        public void LoadKeys()
-        {
-            KeysJson? keys;
-            try
-            {
-                keys = JsonSerializer.Deserialize<KeysJson>(File.OpenRead(@$"{currentDirectory}/keys.json"));
-            }
-            catch (Exception)
-            {
-                Console.WriteLine("Не удалось десериализовать ключи либо открыть файл с ними");
-                Console.ReadKey(true);
-                throw;
-            }
-
-            token = keys.token;
-            groupId = keys.groupId;
-            v = keys.v;
         }
 
         /// <summary>
@@ -245,14 +239,16 @@ namespace AutoArtPoster
         /// <param name="method">Вызываемый в VK API метод. Например, wall.get</param>
         /// <param name="extraValues">Параметры, которые войдут в POST-запрос. Например, filter=postponed</param>
         /// <returns>HttpResponseMessage, из которого можно достать JSON</returns>
-        async public Task<HttpResponseMessage> CallVkMethod(string method, Dictionary<string, string> extraValues)
+        async private Task<HttpResponseMessage> CallVkMethod(string method, Dictionary<string, string> extraValues)
         {
-            var values = new Dictionary<string, string>(extraValues);
-            values.Add("access_token", token);
-            values.Add("v", v);
+            var values = new Dictionary<string, string>(extraValues)
+            {
+                { "access_token", _config.token },
+                { "v", _config.v }
+            };
 
             var content = new FormUrlEncodedContent(values);
-            var response = await http.PostAsync($"https://api.vk.com/method/{method}?", content);
+            var response = await _http.PostAsync($"https://api.vk.com/method/{method}?", content);
 
             // Проверка на ошибки
             var responseContent = await response.Content.ReadAsStringAsync();
@@ -266,10 +262,7 @@ namespace AutoArtPoster
                     .GetProperty("error")
                     .GetProperty("error_msg")
                     .ToString();
-                Console.WriteLine("VK API вернул ошибку " + error_code);
-                Console.WriteLine(error_msg);
-                Console.ReadKey(true);
-                throw new Exception();
+                throw new VkApiException(error_code, error_msg);
             }
             catch (KeyNotFoundException)
             {
@@ -279,6 +272,90 @@ namespace AutoArtPoster
             {
                 throw;
             }
+        }
+
+        private Config LoadKeysFromConfig()
+        {
+            Config keys;
+
+            try
+            {
+                var fs = File.OpenRead(@$"{_currentDirectory}\{_configFileName}");
+                keys = JsonSerializer.Deserialize<Config>(fs);
+                fs.Close();
+            }
+            catch (Exception)
+            {
+                Console.WriteLine("Не удалось десериализовать ключи либо открыть файл с ними");
+                throw;
+            }
+
+            return keys;
+        }
+
+        private void CreateConfigIfNotExist()
+        {
+            if (File.Exists(@$"{_currentDirectory}/{_configFileName}"))
+                return;
+
+            Config _data = new Config
+            {
+                clientId = "",
+                token = "",
+                groupId = "",
+                v = "5.131",
+            };
+            
+            string json = JsonSerializer.Serialize(_data);
+            File.WriteAllText(@$"{_currentDirectory}/{_configFileName}", json);
+
+            Console.WriteLine("Конфигурационный файл не был обнаружен. Создан новый файл. Нажмите любую кнопку после заполнения файла");
+            Console.ReadKey(true);
+        }
+
+        async private Task ValidateAccessToken()
+        {
+            var values = new Dictionary<string, string>
+            {
+                { "owner_id", $"-{_config.groupId}" },
+                { "count", "1" }
+            };
+
+            try
+            {
+                var response = await CallVkMethod("wall.get", values);
+                return;
+            }
+            catch (VkApiException ex)
+            {
+                if (ex.ErrorCode == "5")
+                {
+                    GetAccessToken();
+                }
+                else
+                {
+                    throw;
+                }
+            }
+        }
+
+        private void GetAccessToken()
+        {
+            var urlToGetToken = @$"https://oauth.vk.com/authorize?client_id={_config.clientId}&display=page&redirect_uri=https://oauth.vk.com/blank.html&scope=groups,wall,photos&response_type=token&v={_config.v}";
+            Process.Start("explorer.exe", $"\"{urlToGetToken}\"");
+
+            Console.WriteLine("Введите полученный access_token:");
+            string input = Console.ReadLine();
+
+            // т.к. конфиг уже загружен, заменяем его и в коде, и в файле
+            _config.token = input;
+            File.WriteAllText(@$"{_currentDirectory}/{_configFileName}", JsonSerializer.Serialize(_config));
+            Console.WriteLine("Access token обновлен");
+        }
+
+        private void DeleteTempFiles()
+        {
+            File.Delete(@$"{_currentDirectory}/{_uploadFileName}");
         }
 
         private UploadedPhoto GetUploadedPhoto(string json)
@@ -301,7 +378,7 @@ namespace AutoArtPoster
         }
     }
 
-    // загруженное на сервер но не добавленное в альбом
+    // загруженное на сервер фото как данные, необходимые для добавления в альбом
     public class UploadedPhoto
     {
         public int server { get; set; }
@@ -309,10 +386,23 @@ namespace AutoArtPoster
         public string hash { get; set; }
     }
 
-    public class KeysJson
+    public class Config
     {
+        public string clientId { get; set; }
         public string token { get; set; }
         public string groupId { get; set; }
         public string v { get; set; }
+    }
+
+    public class VkApiException : Exception
+    {
+        public string ErrorCode;
+        public string ErrorMsg;
+
+        public VkApiException(string code, string msg) : base($"VK API вернул ошибку {code}: {msg}")
+        {
+            ErrorCode = code;
+            ErrorMsg = msg;
+        }
     }
 }

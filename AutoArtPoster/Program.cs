@@ -10,12 +10,19 @@ namespace AutoArtPoster
 
         static async Task Main(string[] args)
         {
-            Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+            try
+            {
+                // Без этого HttpClient выдает System.InvalidOperationException в асинхронных методах
+                Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
 
-            var poster = new Poster(http);
-            await poster.StartExecution();
-
-            http.Dispose();
+                var poster = new Poster(http);
+                await poster.StartExecution();
+            }
+            finally
+            {
+                http.Dispose();
+                Console.ReadKey(true);
+            }
         }
     }
 }
