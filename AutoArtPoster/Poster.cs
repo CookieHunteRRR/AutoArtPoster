@@ -1,4 +1,6 @@
 ﻿using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Text;
 using System.Text.Json;
 
 namespace AutoArtPoster
@@ -11,7 +13,7 @@ namespace AutoArtPoster
         private List<string> _savedPhotos;
 
         // Часы, на которые откладывать посты по UTC (MSK-3)
-        private readonly HashSet<int> _postingHours = new HashSet<int>() { 9, 13, 17 };
+        private HashSet<int> _postingHours = new HashSet<int>();
         private readonly string _configFileName = "config.json";
         private readonly string _uploadFileName = "upload.txt";
 
@@ -23,7 +25,7 @@ namespace AutoArtPoster
 
             CreateConfigIfNotExist();
             _config = LoadKeysFromConfig();
-
+            CheckConfigTimeValidity();
         }
 
         async public Task StartExecution()
@@ -107,8 +109,11 @@ namespace AutoArtPoster
                 values["publish_date"] = nextPublishDate;
 
                 var response = await CallVkMethod("wall.post", values);
-                var postTime = DateTime.UnixEpoch.AddSeconds(Int32.Parse(nextPublishDate));
-                Console.WriteLine($"Успешно создана отложенная запись на дату {postTime.Day}.{postTime.Month}.{postTime.Year} {postTime.Hour}:{postTime.Minute}");
+                
+                var postTime = DateTime.SpecifyKind(DateTime.UnixEpoch.AddSeconds(Int32.Parse(nextPublishDate)), DateTimeKind.Utc);
+                var localPostTime = postTime.ToLocalTime();
+                Console.WriteLine($"Успешно создана отложенная запись на дату {postTime.Day}.{postTime.Month}.{postTime.Year} {GetNiceNumber(postTime.Hour)}:{GetNiceNumber(postTime.Minute)} UTC\n" +
+                    $"Local: {localPostTime.Day}.{localPostTime.Month}.{localPostTime.Year} {GetNiceNumber(localPostTime.Hour)}:{GetNiceNumber(localPostTime.Minute)}");
 
                 nextPublishDate = GetAppropriatePostTime(nextPublishDate);
                 // Небольшая задержка, чтобы API не послал меня куда подальше из-за спама
@@ -127,14 +132,17 @@ namespace AutoArtPoster
                 throw new Exception();
             }
 
-            // В 20:00 по МСК
-            if (prevPost.Hour == 17)
+            // В финальный час для постинга
+            if (prevPost.Hour == _config.utcFinalHour)
             {
-                return ((DateTimeOffset)(prevPost.AddHours(16))).ToUnixTimeSeconds().ToString();
+                // Создаем пост в указанное стартовое время следующего дня
+                var hoursTillNextDay = 24 - prevPost.Hour + _config.utcStartingHour;
+                return ((DateTimeOffset)prevPost.AddHours(hoursTillNextDay)).ToUnixTimeSeconds().ToString();
             }
             else
             {
-                return ((DateTimeOffset)(prevPost.AddHours(4))).ToUnixTimeSeconds().ToString();
+                // Создаем пост через указанный промежуток от предыдущего поста
+                return ((DateTimeOffset)prevPost.AddHours(_config.interval)).ToUnixTimeSeconds().ToString();
             }
         }
 
@@ -174,7 +182,7 @@ namespace AutoArtPoster
             return latestDate;
         }
 
-        // Возвращаем сегодняшнюю дату в 17:00
+        // Возвращаем сегодняшнюю дату в последний час для постинга
         private string GetLatestAppropriateTimeToday()
         {
             // доходим до ровных чисел
@@ -182,12 +190,12 @@ namespace AutoArtPoster
             now = now.AddSeconds(60 - now.Second);
             now = now.AddMinutes(60 - now.Minute);
             long nowAsUnix = now.ToUnixTimeSeconds();
-            if (now.Hour == 17) return nowAsUnix.ToString();
-            var diff = 0;
-            if (now.Hour > 17)
-                diff = now.Hour - 17;
+            if (now.Hour == _config.utcFinalHour) return nowAsUnix.ToString();
+            int diff;
+            if (now.Hour > _config.utcFinalHour)
+                diff = now.Hour - _config.utcFinalHour;
             else
-                diff = 17 - now.Hour;
+                diff = _config.utcFinalHour - now.Hour;
             return (nowAsUnix + (3600 * diff)).ToString();
         }
 
@@ -274,6 +282,40 @@ namespace AutoArtPoster
             }
         }
 
+        private void CheckConfigTimeValidity()
+        {
+            if (_config.utcStartingHour < 0 || _config.utcStartingHour > 23)
+            {
+                Console.WriteLine("Стартовый час не может быть меньше 0 и больше 23");
+                throw new Exception();
+            }
+            if (_config.utcFinalHour < 0 || _config.utcFinalHour > 23)
+            {
+                Console.WriteLine("Финальный час не может быть меньше 0 и больше 23");
+                throw new Exception();
+            }
+            if (_config.utcFinalHour <= _config.utcStartingHour)
+            {
+                // Ну вообще может в теории, но мне-то зачем так заморачиваться
+                Console.WriteLine("Финальный час не может быть меньше или равен стартовому часу");
+                throw new Exception();
+            }
+            if ((_config.utcFinalHour - _config.utcStartingHour) % _config.interval != 0)
+            {
+                Console.WriteLine("С выбранным интервалом невозможно будет запостить в финальный час");
+                throw new Exception();
+            }
+
+            _postingHours.Add(_config.utcStartingHour);
+            int nextHour = _config.utcStartingHour + _config.interval;
+            while (nextHour != _config.utcFinalHour)
+            {
+                _postingHours.Add(nextHour);
+                nextHour += _config.interval;
+            }
+            _postingHours.Add(_config.utcFinalHour);
+        }
+
         private Config LoadKeysFromConfig()
         {
             Config keys;
@@ -300,6 +342,9 @@ namespace AutoArtPoster
 
             Config _data = new Config
             {
+                utcStartingHour = 9,
+                utcFinalHour = 17,
+                interval = 4,
                 clientId = "",
                 token = "",
                 groupId = "",
@@ -353,6 +398,12 @@ namespace AutoArtPoster
             Console.WriteLine("Access token обновлен");
         }
 
+        private string GetNiceNumber(int numberToFix)
+        {
+            if (numberToFix < 10) return $"0{numberToFix}";
+            return numberToFix.ToString();
+        }
+
         private void DeleteTempFiles()
         {
             File.Delete(@$"{_currentDirectory}/{_uploadFileName}");
@@ -388,6 +439,9 @@ namespace AutoArtPoster
 
     public class Config
     {
+        public int utcStartingHour { get; set; }
+        public int utcFinalHour { get; set; }
+        public int interval { get; set; }
         public string clientId { get; set; }
         public string token { get; set; }
         public string groupId { get; set; }
